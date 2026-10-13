@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+# kit files and local helpers that must not be in the submission repo
+sample_data/
+sample_seed.py
+dev_check.py
+PROBLEM_STATEMENT.docx
+openapi.yaml
+DATA_MODEL.md
+ref.tct
