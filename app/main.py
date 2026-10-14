@@ -50,12 +50,12 @@ MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
 # tz_aware=True: PyMongo hands back timezone-aware (UTC) datetimes instead of naive ones,
 # so every datetime in this file is aware and arithmetic between them is always valid.
 client = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=5000)
-db = client[MONGO_DB]
-employees = db["employees"]
-logs = db["attendance_logs"]
+db = client[MONGO_DB]# this intializes the database handle and ensures the connection is established
+employees = db["employees"]# taking employees collection from the database
+logs = db["attendance_logs"]# attendance_logs collection from the database
 
 UTC = timezone.utc
-IST = timezone(timedelta(hours=5, minutes=30))
+IST = timezone(timedelta(hours=5, minutes=30))#setting IST timezone for India Standard Time (UTC+5:30)
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 ONE_SECOND = timedelta(seconds=1)
 
@@ -70,6 +70,7 @@ def aware(dt: Optional[datetime]) -> Optional[datetime]:
     """Naive datetimes from MongoDB are UTC by definition; make them explicit."""
     if dt is None:
         return None
+    # If the datetime is naive (no timezone info), we assume it's in UTC and set the tzinfo to UTC.
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
 
@@ -81,8 +82,9 @@ def trunc(dt: Optional[datetime]) -> Optional[datetime]:
 
 def to_ms(dt: Optional[datetime]) -> Optional[int]:
     """datetime -> epoch milliseconds (exact integer arithmetic, no float)."""
+    
     dt = aware(dt)
-    return None if dt is None else (dt - EPOCH) // timedelta(milliseconds=1)
+    return None if dt is None else (dt - EPOCH) // timedelta(milliseconds=1)# timedelta is a class that represents a duration, the difference between two dates or times. Here, we are calculating the difference between the given datetime and the epoch (January 1, 1970) in milliseconds.
 
 
 def from_ms(ms: int) -> datetime:
@@ -129,7 +131,8 @@ def count_weekdays(first: Date, last: Date) -> int:
 
 def unprocessable(message: str, loc: tuple = ("body",)) -> RequestValidationError:
     """A 422 with FastAPI's standard {"detail": [...]} body."""
-    return RequestValidationError([{"type": "value_error", "loc": loc, "msg": message, "input": None}])
+    return RequestValidationError([{"type": "value_error", "loc": loc, "msg": message, "input": None}]) # this function creates a RequestValidationError with a specific message and location. The error is structured in a way that FastAPI can understand and return it as a 422 Unprocessable Entity response to the client.
+
 
 
 # --------------------------------------------------------------------------- #
@@ -196,8 +199,9 @@ class RegularizeIn(BaseModel):
     punch_out: Optional[EpochMs] = None
     reason: Annotated[str, Field(min_length=5, max_length=200)]
     regularized_by: Annotated[str, Field(min_length=1, max_length=50)]
-
+ # this class defines the input model for regularizing attendance records. It includes optional fields for status, punch-in and punch-out times, a reason for the regularization, and the name of the person who regularized the record.
     @model_validator(mode="before")
+    
     @classmethod
     def _no_explicit_null(cls, data):
         # "Omitted fields are unchanged" - an explicit null is not the same as omitted.
@@ -229,6 +233,7 @@ def _hist_value(v: Any) -> Any:
 
 
 def history_out(entries: Optional[list]) -> list:
+    # Convert the history entries from MongoDB format to API JSON format, converting datetime fields to epoch milliseconds.
     out = []
     for e in entries or []:
         changes = {
@@ -280,6 +285,7 @@ def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str
 
 
 def _ist_instant(date_str: str, hhmm: str, plus_days: int = 0) -> datetime:
+    # Return an aware IST datetime for the given date and hh:mm, optionally plus some days.
     day = Date.fromisoformat(date_str) + timedelta(days=plus_days)
     h, m = divmod(_minutes(hhmm), 60)
     return datetime(day.year, day.month, day.day, h, m, tzinfo=IST)
@@ -290,6 +296,7 @@ def compute_late_minutes(punch_in: datetime, shift_start: str, att_date: str) ->
     since shift_start (not since the end of the grace period)."""
     seconds = (trunc(punch_in) - _ist_instant(att_date, shift_start)) // ONE_SECOND
     return seconds // 60 if seconds > 600 else 0
+# means here that if the employee punches in more than 10 minutes (600 seconds) after the shift start time, the function calculates the number of whole minutes late by dividing the total seconds late by 60. If the employee is not late (i.e., punches in within 10 minutes of the shift start), it returns 0.
 
 
 def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, att_date: str) -> int:
@@ -301,7 +308,7 @@ def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, att_
 
 
 def work_hours_hundredths(punch_in: datetime, punch_out: datetime) -> int:
-    """R4 in exact integer arithmetic: floor(seconds * 100 / 3600 + 1/2) == half-up to 2 dp."""
+    # THIS IS THE ONLY PLACE WHERE trunc() IS USED ON BOTH IN AND OUT. R4: round half-up to 2 decimal places. and this function calculates the total work hours in hundredths (i.e., two decimal places) by taking the difference between the punch-out and punch-in times, truncating both to whole seconds, and then converting the result to hundredths of an hour. The formula used is (200 * seconds + 3600) // 7200, which effectively rounds the result to the nearest hundredth of an hour.
     seconds = (trunc(punch_out) - trunc(punch_in)) // ONE_SECOND
     return (200 * seconds + 3600) // 7200
 
@@ -324,6 +331,7 @@ def derived_for_closed(emp: dict, att_date: str, punch_in: datetime, punch_out: 
 # 6. Query / aggregation builders. The explain endpoint calls the SAME builders.
 # --------------------------------------------------------------------------- #
 # Index key patterns used as hints so the plan is deterministic.
+#here are some index key patterns that are used as hints to optimize query performance in MongoDB. These hints help the database engine choose the most efficient index for executing queries, ensuring that the queries run faster and more efficiently.
 HINT_LOG_EMP_DATE = {"emp_code": 1, "date": 1}
 HINT_LOG_DATE = {"date": -1, "emp_code": 1}
 HINT_EMP_DEPT_JOINED = {"department": 1, "joined_on": 1}
@@ -341,6 +349,7 @@ _HAS_WORK_HOURS = {"$and": [_IS_PRESENT, {"$isNumber": "$work_hours"}]}
 
 
 def attendance_list_spec(emp_code, date_from, date_to, status, page, page_size) -> dict:
+    # this function constructs a query specification for retrieving attendance records based on the provided filters such as employee code, date range, status, and pagination parameters. It returns a dictionary containing the filter criteria, sorting order, and pagination details to be used in a MongoDB query.
     if date_from and date_to and date_from > date_to:
         raise unprocessable("date_from must not be after date_to", ("query", "date_from"))
     q: dict = {}
@@ -363,6 +372,7 @@ def attendance_list_spec(emp_code, date_from, date_to, status, page, page_size) 
 
 
 def employee_monthly_pipeline(emp_code: str, start: str, end: str) -> list:
+    # this function constructs an aggregation pipeline for retrieving monthly attendance statistics for a specific employee within a given date range. The pipeline includes stages to filter records by employee code and date, group the results to calculate various attendance metrics (such as present days, leave days, late count, total late minutes, and total overtime minutes), and return the aggregated results in a structured format.
     return [
         {"$match": {"emp_code": emp_code, "date": {"$gte": start, "$lte": end}}},
         {
@@ -430,6 +440,7 @@ def department_summary_pipeline(start: str, end: str, department: Optional[str])
 
 
 def late_leaderboard_pipeline(start: str, end: str, limit: int, department: Optional[str]) -> list:
+    # here is a function that constructs an aggregation pipeline for generating a leaderboard of employees based on their late attendance records within a specified date range. The pipeline includes stages to filter records by date and late minutes, group the results by employee code to calculate total late minutes and count of late occurrences, join with the employees collection to get employee details, and finally rank the employees based on their total late minutes while applying any department filter if provided.
     pipeline: list = [
         {"$match": {"date": {"$gte": start, "$lte": end}, "late_minutes": {"$gt": 0}}},
         {"$group": {"_id": "$emp_code", "total_late_minutes": {"$sum": "$late_minutes"}, "late_count": {"$sum": 1}}},
@@ -438,6 +449,7 @@ def late_leaderboard_pipeline(start: str, end: str, limit: int, department: Opti
     ]
     if department is not None:
         pipeline.append({"$match": {"emp.department": department}})  # rank INSIDE the department
+        
     pipeline += [
         {"$match": {"total_late_minutes": {"$gt": 0}}},
         # $rank = standard competition ranking: ties share a rank, the next rank is skipped (1,2,2,4)
@@ -637,6 +649,7 @@ def ensure_indexes() -> None:
 
 
 @asynccontextmanager
+#this function is an asynchronous context manager that handles the lifespan of the FastAPI application. It attempts to ensure that the necessary indexes are created in the MongoDB database when the application starts. If the database is not reachable, it retries up to three times with a one-second delay between attempts. If there is a PyMongoError (e.g., due to bad existing data), it logs the error and does not crash the service. The function yields control back to the FastAPI application, allowing it to run normally after the index creation attempts.
 async def lifespan(_app: FastAPI):
     for attempt in range(1, 4):
         try:
@@ -911,6 +924,7 @@ def department_summary(month: MonthStr, department: Optional[str] = None):
 
 
 @app.get("/analytics/leaderboard/late")
+# this endpoint retrieves a leaderboard of employees based on their late attendance records for a specified month. It allows optional filtering by department and limits the number of results returned. The function calculates the start and end dates of the month, constructs an aggregation pipeline to gather the relevant data from the attendance logs, and formats the results into a structured response containing employee ranks, codes, names, departments, total late minutes, and late counts.
 def late_leaderboard(
     month: MonthStr,
     limit: int = Query(10, ge=1, le=50),
@@ -968,6 +982,7 @@ def _explain(command: dict) -> dict:
 
 
 @app.get("/admin/explain/{endpoint}")
+# this endpoint provides an explanation of the execution plan for various analytics endpoints in the application. It allows administrators to understand how MongoDB will execute the queries associated with specific endpoints, which can help in optimizing performance and diagnosing issues. The function constructs the appropriate MongoDB command based on the specified endpoint and its parameters, then retrieves and returns the execution plan using the explain command.
 def admin_explain(
     endpoint: Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"],
     emp_code: Optional[str] = None,

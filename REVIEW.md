@@ -1,33 +1,113 @@
-# REVIEW.md
+# Code Review: `app/main.py`
 
-Defects found in the starter `app/main.py`. Every one is fixed in the submitted file.
+## Overview
 
-| # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
-|---|---|---|---|---|
-| 1 | `MongoClient(...)` | Created without `tz_aware=True`, so every datetime read from MongoDB is naive. Naive and aware values cannot be subtracted or compared. | `POST /attendance/punch-out` style code like `compute_overtime` raises `TypeError: can't subtract offset-naive and offset-aware datetimes` (500). | `tz_aware=True`; all helpers use aware UTC and convert to IST only where a rule needs it. |
-| 2 | `health()` | Always returns 200 and never touches MongoDB. | Stop MongoDB and call `/health`: still 200. | Runs `ping`; any `PyMongoError` gives 503. |
-| 3 | `create_employee` | Check-then-insert race and no unique index. Two parallel creates with the same `emp_code` both pass the `find_one` and both insert. | 10 parallel `POST /employees` with one `emp_code` give several 201 and duplicate rows. | Unique index `uq_emp_code` created at startup; `insert_one` and `DuplicateKeyError` give 409. |
-| 4 | `EmployeeIn` | No validation: any string for `emp_code`, `email`, shifts and `joined_on`; `shift_start == shift_end` allowed. | `emp_code="x"`, `joined_on="2026-02-30"`, `shift_start="25:99"` are all accepted (201). | Pattern, length and date validators; shifts must differ. All give 422. |
-| 5 | `create_employee` | `created_at = datetime.now()` is naive server-local time, and the response returns a datetime (ISO string) instead of epoch milliseconds. | Response has `"created_at": "2026-07-13T09:30:00.123"` instead of an integer; value shifts with the server time zone. | `datetime.now(UTC)` stored; `to_ms()` at the API boundary. |
-| 6 | `list_employees` | `skip = page * page_size`, so page 1 skips the first page. | `GET /employees?page=1` never returns the first 20 employees. | `skip = (page - 1) * page_size`. |
-| 7 | `list_employees` | `total = count_documents({})` ignores the department filter. | `?department=Sales` returns 2 items with `total` = all employees. | `count_documents` uses the same filter as the query. |
-| 8 | `list_employees` | No sort, and `page` / `page_size` unbounded. `page=0` gives a negative skip (500) and `page_size=100000` loads everything. | `GET /employees?page=0` returns 500. | Sort by `emp_code`; `page >= 1`, `1 <= page_size <= 100` (422 otherwise). |
-| 9 | `punch_in` | Unknown employee: `emp` is `None` and `emp["shift_start"]` raises `TypeError`. | `POST /attendance/punch-in {"emp_code":"NOPE"}` returns 500, contract says 404. | Explicit 404 before using `emp`. |
-| 10 | `punch_in` | Timestamp handling: `fromtimestamp(ms / 1000)` uses the server's local zone and naive datetimes; `if body.punched_at` treats 0 as missing; sub-second part is kept; seconds-looking values, floats and strings are not rejected. | `punched_at=1783312500` (seconds) is accepted as 1970; `09:40:00.900` is stored with milliseconds. | `StrictInt` with range, converted by exact integer maths and truncated to whole seconds (R1). Default is `now` truncated. |
-| 11 | `punch_in` | `date` comes from `ts.date()` in the server zone, not the IST attendance date; the overnight rule is ignored. | Punch-in at 05:30 IST for a 22:00-06:00 employee should belong to the previous day. A server in UTC also gets the wrong date after 18:30 UTC. | `attendance_date()` implements R1 (IST date, overnight shift belongs to previous day). |
-| 12 | `punch_in` | Check-then-insert race: two simultaneous punch-ins both see no record and both insert. | Parallel identical requests give two 201 and two documents. | Unique index `(emp_code, date)`; a single `insert_one` and `DuplicateKeyError` give 409. |
-| 13 | `PunchInIn` | `status` is a free string: `ABSENT`, `LEAVE` or `banana` are accepted at punch-in. | `{"status":"banana"}` returns 201. | `Literal["PRESENT","WFH","ON_DUTY"]`; anything else is 422. |
-| 14 | `punch_in` response | Leaks the internal ObjectId as `id` (contract: `_id` never appears) and returns datetimes instead of epoch ms. | Response contains `id` and `punch_in` as an ISO string. | `record_out()` builds the response from explicit fields with ms integers. |
-| 15 | `compute_late_minutes` | The floor happens before the comparison (`int(seconds/60) > 10`), so 09:40:01 gives 10 which is not greater than 10, returning 0 (should be 10). Also it replaces the time on the punch-in's own date, so overnight and zone cases are wrong, and does not truncate to whole seconds. | Shift 09:30, punch-in 09:40:01 gives 0 instead of 10. | Compares whole seconds `> 600` against the shift start of the attendance date, then floors to minutes. |
-| 16 | `compute_work_hours` | Python `round()` on a float is banker's rounding on a binary value, not half-up. | 9h 0m 18s is exactly 9.005 and must give 9.01. | Integer maths `(200*seconds + 3600) // 7200` gives exact half-up hundredths. |
-| 17 | `compute_overtime` | No 30-minute minimum (any 1 minute counts), assumes shift end is on the punch date (wrong for overnight), and subtracts a naive datetime from an aware one (TypeError). | Punch-out 18:45 for shift end 18:30 returns 15 instead of 0. | Shift end built from the attendance date (+1 day for overnight), floor minutes, 0 when below 30. |
-| 18 | `list_attendance` | Loads the whole collection into memory, sorts and paginates in Python; only sorts by date (no `emp_code` tie-break). `total` is computed from the loaded list. | 100k records means seconds per request and high memory. Same-date rows come in arbitrary order. | MongoDB does filter, sort `(date desc, emp_code asc)`, skip, limit and count. |
-| 19 | `list_attendance` | No validation: bad `status`, malformed dates, `date_from > date_to`, `page_size` unbounded. Legacy documents without `history` / `half_day` / `late_minutes` come back with missing fields. Leaks `id`. | `?status=banana` returns 200 empty; `?date_from=zzz` returns 200. | Typed query params give 422; `date_from > date_to` gives 422; `record_out()` fills defaults (0, false, []). |
-| 20 | whole file | No indexes at all, so every query is a collection scan. | `explain` shows `COLLSCAN`; slow at 100k. | `ensure_indexes()` runs in the startup lifespan and is idempotent. |
+During the review of the starter `app/main.py` file, I identified 20 issues related to datetime handling, input validation, database consistency, API responses, attendance calculations, pagination, and query performance. I addressed these issues to make the application more reliable, improve data accuracy, handle invalid requests properly, and ensure that the application continues to perform efficiently as the database grows.
 
-## Looked at and decided it was fine
+## Defects Identified and Fixed
 
-- Endpoints are plain `def`, so FastAPI runs them in a thread pool; blocking PyMongo calls do not block the event loop. I kept them as `def` on purpose.
-- `load_dotenv()` does not override variables already in the environment, so real environment variables win as required.
-- `doc.pop("_id", None)` after `insert_one` is correct (PyMongo adds `_id` to the dict). I replaced it with a copy plus an explicit serializer, but it was not a bug.
-- `MongoClient(...)` at import time is lazy (no connection until first use), so the app starts even if MongoDB is slow to come up.
+**1. MongoDB Timezone Handling**
+
+The application initially returned MongoDB datetime values without timezone information. This could cause errors when comparing them with timezone-aware datetime objects, particularly in the `compute_overtime` function. Such mismatches could result in a `TypeError` and cause the API to return a 500 Internal Server Error. To resolve this, I enabled `tz_aware=True` in the MongoDB client configuration and updated datetime operations to use timezone-aware UTC values. Conversion to IST is performed when required by the attendance rules.
+
+**2. Health Check Endpoint**
+
+The original `health()` endpoint returned a successful response even when MongoDB was unavailable. This made it difficult to determine whether the application could actually communicate with the database. I added a database ping to the health check so that it verifies the database connection before reporting success. If a `PyMongoError` occurs, the endpoint now returns HTTP 503, indicating that the service is temporarily unavailable.
+
+**3. Duplicate Employee Records**
+
+The employee creation endpoint could create duplicate employee records when multiple requests using the same employee code arrived at nearly the same time. The existing duplicate check alone was not sufficient to prevent this race condition. I addressed this by adding a unique index on `emp_code` and handling `DuplicateKeyError` exceptions. As a result, duplicate employee codes are rejected with HTTP 409 Conflict instead of creating inconsistent records.
+
+**4. Employee Input Validation**
+
+The `EmployeeIn` model did not adequately validate employee details. Invalid employee codes, email addresses, joining dates, and shift timings could pass through the input validation process. For example, values such as `emp_code="x"`, an impossible date like `2026-02-30`, or an invalid time such as `25:99` could cause problems. I introduced appropriate pattern, length, date, email, and time validations. I also ensured that shift start and end times cannot be identical. Invalid input now produces HTTP 422 Unprocessable Entity.
+
+**5. Employee Creation Timestamp**
+
+The `create_employee` endpoint originally generated `created_at` using the server's local time and returned the timestamp as a formatted string. This could lead to inconsistent timestamp interpretation across different environments. I changed the implementation to use `datetime.now(UTC)` and the `to_ms()` helper function. The API now returns the timestamp as an integer representing milliseconds since the Unix epoch, making the response more consistent.
+
+**6. Employee Pagination**
+
+The pagination logic in `list_employees` contained an incorrect offset calculation, which caused the first page to skip the initial employee records. This made the results incomplete and difficult to navigate correctly. I fixed the calculation by using `skip = (page - 1) * page_size`, ensuring that the first page starts from the beginning of the result set and subsequent pages return the appropriate records.
+
+**7. Employee Count with Department Filtering**
+
+When employees were filtered by department, the endpoint returned the matching employees but calculated the total count across all departments. This meant that the reported total did not correspond to the filtered results. I corrected the implementation so that the same department filter is applied to both the employee query and `count_documents()`. The response now reports a count consistent with the selected department.
+
+**8. Pagination Limits and Sorting**
+
+The employee listing endpoint did not enforce reasonable pagination limits or a consistent sorting order. For example, requesting page zero could cause errors, while an extremely large page size could retrieve too many records and affect performance. I added validation requiring `page` to be at least 1 and restricting `page_size` to a range of 1 to 100. I also introduced sorting by `emp_code` so that the results are returned in a predictable order. Invalid pagination values now result in HTTP 422.
+
+**9. Handling Unknown Employees During Punch-In**
+
+The `punch_in` endpoint did not properly handle requests for employee codes that did not exist in the database. When an employee lookup returned `None`, the application attempted to access fields such as `shift_start`, resulting in a 500 Internal Server Error. I added an explicit check immediately after retrieving the employee record. If the employee does not exist, the API now returns HTTP 404 Not Found instead of failing unexpectedly.
+
+**10. Punch-In Timestamp Validation**
+
+The original punch-in logic did not properly validate the timestamp's type, precision, or interpretation. A timestamp of `0` could incorrectly be treated as missing, and values expressed in seconds rather than milliseconds could be interpreted incorrectly. Fractional seconds could also remain in calculations where whole-second precision was required. I introduced `StrictInt` validation and range checks, converted timestamps using integer arithmetic, and truncated them to whole seconds. The default timestamp is also handled at whole-second precision.
+
+**11. Attendance Date and Overnight Shifts**
+
+The application originally determined attendance dates using the server's local timezone. This could produce incorrect attendance records when the server timezone differed from IST, particularly for overnight shifts. For example, a punch-in at 05:30 IST for a shift running from 22:00 to 06:00 should belong to the previous attendance date. I introduced an `attendance_date()` helper function to handle IST conversion and apply the previous-day rule for overnight shifts.
+
+**12. Duplicate Punch-In Prevention**
+
+The punch-in endpoint was vulnerable to duplicate records when two requests for the same employee and attendance date were processed concurrently. Both requests could pass the initial duplicate check and insert separate records. To prevent this, I added a unique compound index on `(emp_code, date)` and implemented handling for `DuplicateKeyError`. If a duplicate punch-in is attempted, the API now returns HTTP 409 Conflict.
+
+**13. Attendance Status Validation**
+
+The `PunchInIn` model originally accepted arbitrary strings for the attendance status. This meant unsupported values such as `ABSENT`, `LEAVE`, or `banana` could be submitted even though they were not valid punch-in statuses. I restricted the field to `Literal["PRESENT", "WFH", "ON_DUTY"]`. This ensures that only supported attendance statuses are accepted, while invalid values receive HTTP 422.
+
+**14. Punch-In Response Format**
+
+The punch-in response exposed the internal MongoDB ObjectId through the `id` field and returned datetime values as strings rather than epoch milliseconds. This did not match the intended API response format. I introduced a `record_out()` helper function to explicitly select the fields returned by the API and convert timestamps into integer epoch milliseconds. The response no longer exposes the internal ObjectId and follows a more consistent structure.
+
+**15. Late-Minute Calculation**
+
+The `compute_late_minutes` function calculated late arrivals incorrectly because it converted values to integers before checking the lateness threshold. It also constructed the shift start using the wrong date in certain overnight and timezone-sensitive situations. For example, an employee scheduled to start at 09:30 and punching in at 09:40:01 could incorrectly be recorded as having zero late minutes. I corrected the calculation to compare whole-second timestamps against the appropriate shift start, apply the 600-second threshold, and then calculate completed late minutes.
+
+**16. Work-Hour Rounding**
+
+The `compute_work_hours` function used Python's built-in `round()` method, which follows ties-to-even rounding. This could produce results that differed from the required half-up rounding rule. For instance, a duration of 9 hours, 0 minutes, and 18 seconds equals 9.005 hours and should be reported as 9.01 hours. I replaced floating-point rounding with integer arithmetic using `(200 * seconds + 3600) // 7200`. This implements the required half-up rounding to two decimal places without relying on floating-point rounding behavior.
+
+**17. Overtime Calculation**
+
+The overtime calculation did not consistently enforce the 30-minute minimum and assumed that the shift ended on the same date as the punch-out. It could also fail when subtracting timezone-aware and timezone-naive datetime values. For example, punching out at 18:45 for a shift ending at 18:30 should not count as overtime under the 30-minute minimum rule, but the original logic could record 15 minutes. I updated the calculation to determine the correct shift-end datetime from the attendance date, account for overnight shifts, and calculate overtime in whole minutes. Overtime below 30 minutes is now recorded as zero.
+
+**18. Attendance Query Performance**
+
+The `list_attendance` endpoint originally loaded the entire attendance collection into application memory before sorting and applying pagination. This approach could become slow and consume excessive memory as the number of records increased. The sorting logic also lacked an `emp_code` tie-breaker, making the ordering of records with identical dates inconsistent. I moved filtering, sorting, pagination, and counting into MongoDB itself. The results are now sorted by date in descending order and employee code in ascending order, reducing unnecessary data transfer and improving query efficiency.
+
+**19. Attendance Query Validation and Response Consistency**
+
+The attendance listing endpoint did not adequately validate its query parameters. Invalid statuses, malformed dates, reversed date ranges, and excessively large page requests could lead to incorrect results or unnecessary database work. In addition, older attendance records might not contain fields such as `history`, `half_day`, or `late_minutes`, and the response exposed an `id` field. I added typed query-parameter validation, rejected requests where `date_from` is later than `date_to`, and introduced pagination limits. The `record_out()` helper now supplies default values of `0`, `false`, and `[]` for missing `late_minutes`, `half_day`, and `history` fields, respectively, while preventing the internal ObjectId from appearing in the response.
+
+**20. Database Indexing**
+
+The application initially lacked an organized mechanism for creating the indexes needed to support its database queries. As the number of employees and attendance records increased, some queries could require full collection scans, potentially reducing performance. I introduced an `ensure_indexes()` function that creates the required indexes during the application's startup lifespan. This helps MongoDB locate records more efficiently and allows the index setup to be repeated without unnecessarily recreating existing indexes.
+
+## Additional Design Decisions
+
+During the review, I also examined several implementation choices that were appropriate for the application's current requirements. These decisions were retained or clarified rather than treated as defects.
+
+### 1. Synchronous FastAPI Endpoints
+
+The application uses regular `def` functions instead of `async def` for its endpoints. This is appropriate for the current implementation because PyMongo performs blocking database operations. FastAPI executes synchronous endpoints in a thread pool, which helps prevent these database calls from blocking the asynchronous event loop.
+
+### 2. Environment Variable Precedence
+
+The application uses `load_dotenv()` to load configuration values from a `.env` file. By default, existing environment variables take precedence over values in the file. This is useful because deployment-specific configuration can be supplied through the environment without being overwritten by local development settings.
+
+### 3. MongoDB Document Insertion
+
+PyMongo automatically adds an `_id` field when inserting a document that does not already contain one. Removing `_id` from a copied document using `doc.pop("_id", None)` is valid when preparing data for a response. In this implementation, an explicit response serializer is used to control which fields are returned by the API and avoid exposing internal database identifiers.
+
+### 4. MongoDB Client Initialization
+
+Creating a `MongoClient` at module import time does not immediately establish a database connection because the client connects lazily. This allows the application to initialize without requiring MongoDB to respond immediately. The database's actual availability is determined when an operation is performed, such as during the health check.
+
+## Conclusion
+
+The review identified and addressed 20 issues in the submitted `app/main.py` file. The changes improve input validation, timezone handling, attendance calculations, duplicate-record prevention, API response consistency, pagination, and database query performance. Additional improvements to serialization and index management help make the application easier to maintain and more predictable as the dataset grows.
+
+Although these changes address the identified defects, the implementation should still be verified through unit tests, integration tests, and concurrent-request tests. These tests are important for confirming that the fixes behave as expected under normal usage, invalid input, database failures, and simultaneous requests.
